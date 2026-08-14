@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+export PYTHONPATH="$PROJECT_DIR/src:$PYTHONPATH"
+exec python3 -m rag_notion_kb.cli "$@"
