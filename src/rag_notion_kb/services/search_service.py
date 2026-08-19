@@ -7,10 +7,12 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+import tiktoken
+
 from rag_notion_kb.config import Settings
 from rag_notion_kb.embedding.qwen_vl import EmbeddingService
 from rag_notion_kb.embedding.reranker import RerankerService
-from rag_notion_kb.exceptions import RetrievalError, StorageError
+from rag_notion_kb.exceptions import RetrievalError, StorageError, SummarizationError
 from rag_notion_kb.models import (
     ChunkMetadata,
     ChunkType,
@@ -24,10 +26,13 @@ from rag_notion_kb.models import (
     SearchResult,
     SearchSource,
     StageScores,
+    SummarizeResponse,
+    SummaryPassage,
 )
 from rag_notion_kb.retrieval.context_expand import ContextExpander
 from rag_notion_kb.retrieval.hybrid_search import weighted_fusion
 from rag_notion_kb.retrieval.truncate import TokenTruncator
+from rag_notion_kb.services.summarization import SummarizationService
 from rag_notion_kb.storage.milvus_store import MilvusStore
 from rag_notion_kb.storage.search_history_store import SearchHistoryStore
 from rag_notion_kb.storage.sync_state import SyncStateStore
@@ -49,6 +54,7 @@ class SearchService:
         state_store: SyncStateStore,
         config: Settings,
         history_store: SearchHistoryStore | None = None,
+        summarizer: SummarizationService | None = None,
     ) -> None:
         self.embedding = embedding
         self.reranker = reranker
@@ -56,6 +62,7 @@ class SearchService:
         self.state_store = state_store
         self.config = config
         self.history_store = history_store
+        self.summarizer = summarizer
         self.expander = ContextExpander(store)
         self.truncator = TokenTruncator()
 
@@ -99,9 +106,7 @@ class SearchService:
         top_k = top_k if top_k is not None else retrieval_cfg.default_top_k
         max_tokens = max_tokens if max_tokens is not None else retrieval_cfg.default_max_tokens
         if context_mode is None:
-            if expand_to_level is None:
-                context_mode = ContextExpandMode.NONE
-            elif expand_to_level >= 100:
+            if expand_to_level is None or expand_to_level >= 100:
                 context_mode = ContextExpandMode.NONE
             elif expand_to_level <= 1:
                 context_mode = ContextExpandMode.PARENT
@@ -154,7 +159,7 @@ class SearchService:
             raise RetrievalError(response.error)
 
         results = [
-            self._search_result_from_debug_hit(hit)
+            self.to_search_result(hit)
             for hit in response.results
         ]
         if history_source is not None:
@@ -187,8 +192,73 @@ class SearchService:
             )
         return results
 
+    def search_with_summary(
+        self,
+        query: str,
+        top_k: int | None = None,
+        expand_to_level: int | None = None,
+        max_tokens: int | None = None,
+        filters: dict[str, Any] | None = None,
+        history_source: SearchSource = SearchSource.MCP,
+        rerank: bool = True,
+        dense_weight: float = 0.5,
+        sparse_weight: float = 0.5,
+        min_similarity: float = 0.4,
+        rerank_model: str = "qwen3-vl-rerank",
+        context_mode: ContextExpandMode | str | None = ContextExpandMode.H2,
+        summarize: bool = False,
+    ) -> DebugSearchResponse:
+        """Run retrieval and return the full debug response, optionally summarized.
+
+        This is the MCP-facing retrieval path. It records one history entry with
+        the original results and any generated summary.
+        """
+        retrieval_cfg = self.config.retrieval
+        top_k = top_k if top_k is not None else retrieval_cfg.default_top_k
+        max_tokens = max_tokens if max_tokens is not None else retrieval_cfg.default_max_tokens
+        if context_mode is None:
+            if expand_to_level is None or expand_to_level >= 100:
+                context_mode = ContextExpandMode.NONE
+            elif expand_to_level <= 1:
+                context_mode = ContextExpandMode.PARENT
+            else:
+                context_mode = ContextExpandMode.H2
+        else:
+            context_mode = ContextExpandMode(context_mode)
+
+        total_weight = dense_weight + sparse_weight
+        if total_weight > 0 and abs(total_weight - 1.0) > 1e-9:
+            dense_weight /= total_weight
+            sparse_weight /= total_weight
+
+        normalized_filters: dict[str, list[str]] = {}
+        for field, value in (filters or {}).items():
+            values = value if isinstance(value, list) else [value]
+            normalized_filters[field] = [str(item) for item in values]
+
+        request = DebugSearchRequest(
+            query=query,
+            dense_weight=dense_weight,
+            sparse_weight=sparse_weight,
+            top_k=top_k,
+            min_similarity=min_similarity,
+            rerank_model=rerank_model if rerank else "",
+            filters=normalized_filters,
+            context_mode=context_mode,
+            max_tokens=max_tokens,
+            summarize=summarize,
+        )
+        response = self.debug_search(
+            request,
+            record_history=True,
+            source=history_source,
+        )
+        if response.error:
+            raise RetrievalError(response.error)
+        return response
+
     @staticmethod
-    def _search_result_from_debug_hit(hit: DebugSearchHit) -> SearchResult:
+    def to_search_result(hit: DebugSearchHit) -> SearchResult:
         """Convert a debug hit back to the compact production result shape."""
         metadata = ChunkMetadata(
             page_id=hit.page_id,
@@ -208,11 +278,79 @@ class SearchService:
             matched_snippet=hit.matched_snippet,
         )
 
+    def _summarize_results(
+        self,
+        query: str,
+        hits: list[DebugSearchHit],
+    ) -> tuple[str | None, str | None]:
+        """Summarize debug hits, treating image hits as their text context."""
+        if self.summarizer is None:
+            return None, "Summarization is not configured"
+
+        passages: list[tuple[str, str]] = []
+        for hit in hits:
+            text = (hit.expanded_text or hit.chunk_text or "").strip()
+            if not text:
+                text = "[image: no available text]"
+            source = hit.page_title
+            if hit.header_path:
+                source = f"{source} / {hit.header_path}"
+            passages.append((text, source))
+
+        try:
+            return self.summarizer.summarize(query, passages), None
+        except SummarizationError as exc:
+            logger.warning("Summarization failed for query: %s", query)
+            return None, str(exc)
+
+    def summarize_for_web(
+        self,
+        query: str,
+        passages: list[SummaryPassage],
+    ) -> SummarizeResponse:
+        """Summarize passages submitted by the web UI and return display metadata."""
+        if self.summarizer is None:
+            raise SummarizationError("Summarization is not configured")
+
+        pairs = [
+            (passage.text or "[image: no available text]", passage.source)
+            for passage in passages
+        ]
+        started = time.perf_counter()
+        summary = self.summarizer.summarize(query, pairs)
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        source_char_count = sum(len(text) for text, _ in pairs)
+        source_token_count = sum(self._count_tokens(text) for text, _ in pairs)
+        token_count = self._count_tokens(summary)
+        compression_ratio = (
+            token_count / source_token_count if source_token_count else 0.0
+        )
+        return SummarizeResponse(
+            summary=summary,
+            char_count=len(summary),
+            token_count=token_count,
+            model=self.summarizer.config.model,
+            duration_ms=duration_ms,
+            source_char_count=source_char_count,
+            source_token_count=source_token_count,
+            compression_ratio=compression_ratio,
+        )
+
+    @staticmethod
+    def _count_tokens(text: str) -> int:
+        try:
+            encoding = tiktoken.get_encoding("cl100k_base")
+            return len(encoding.encode(text))
+        except Exception:
+            logger.warning("Token counting failed; using character estimate")
+            return max(1, math.ceil(len(text) / 4))
+
     def debug_search(
         self,
         request: DebugSearchRequest,
         *,
         record_history: bool = True,
+        source: SearchSource = SearchSource.DEBUG,
     ) -> DebugSearchResponse:
         """Run the retrieval pipeline and expose scores from every stage.
 
@@ -340,15 +478,20 @@ class SearchService:
                 results=results,
                 latency_ms=int((time.perf_counter() - started) * 1000),
             )
+            if request.summarize and response.results:
+                response.summary, response.summary_error = self._summarize_results(
+                    request.query,
+                    response.results,
+                )
         except (RetrievalError, StorageError) as exc:
             logger.exception("Debug search failed")
             response = _empty_response(error=str(exc))
 
         if record_history:
             final_scores = [hit.scores.final_score for hit in response.results]
-            self._record_history(
+            response.history_id = self._record_history(
                 query=request.query,
-                source=SearchSource.DEBUG,
+                source=source,
                 params=request.model_dump(mode="json"),
                 result_summary={
                     "total_results": len(response.results),
@@ -504,14 +647,15 @@ class SearchService:
         params: dict[str, Any],
         result_summary: dict[str, Any],
         snapshot: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> str | None:
         """Persist a search summary. Storage failures must not break retrieval."""
         if self.history_store is None:
-            return
+            return None
+        history_id = str(uuid.uuid4())
         try:
             self.history_store.add_async(
                 SearchHistory(
-                    history_id=str(uuid.uuid4()),
+                    history_id=history_id,
                     query=query,
                     source=source,
                     params=params,
@@ -520,5 +664,7 @@ class SearchService:
                     created_at=datetime.now(timezone.utc).isoformat(),
                 )
             )
+            return history_id
         except Exception:
             logger.exception("Failed to record search history")
+            return None

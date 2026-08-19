@@ -31,6 +31,10 @@ class RetrievalError(RagKbError):
     """Raised when retrieval pipeline fails."""
 
 
+class SummarizationError(RagKbError):
+    """Raised when the LLM summarization step fails."""
+
+
 def with_notion_retry(func):
     """Retry decorator for idempotent Notion API reads."""
     return retry(

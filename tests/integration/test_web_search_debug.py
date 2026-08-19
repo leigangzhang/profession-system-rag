@@ -10,6 +10,7 @@ from rag_notion_kb.models import (
     DebugSearchResponse,
     SearchHistory,
     SearchSource,
+    SummarizeResponse,
 )
 from rag_notion_kb.storage.search_history_store import SearchHistoryStore
 from rag_notion_kb.web.web_server import create_app
@@ -120,5 +121,111 @@ def test_search_debug_and_history_api() -> None:
 
             missing = client.get("/api/search/history/h1")
             assert missing.status_code == 404
+        finally:
+            history_store.close()
+
+
+def test_search_debug_forwards_summarize_and_returns_summary() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = MagicMock()
+        config.storage.data_dir = tmpdir
+        search_service = MagicMock()
+
+        def _summarized_response(request: DebugSearchRequest, **kwargs: object) -> DebugSearchResponse:
+            return DebugSearchResponse(
+                query=request.query,
+                params=request,
+                total_dense=1,
+                total_sparse=0,
+                total_after_filter=1,
+                total_after_fusion=1,
+                total_after_rerank=0,
+                results=[],
+                latency_ms=12,
+                summary="**summary**",
+            )
+
+        search_service.debug_search.side_effect = _summarized_response
+        history_store = SearchHistoryStore(tmpdir + "/history.db")
+        app = create_app(
+            search_service=search_service,
+            store=MagicMock(),
+            state_store=MagicMock(),
+            config=config,
+            history_store=history_store,
+        )
+        try:
+            client = TestClient(app)
+            response = client.post(
+                "/api/search/debug",
+                json={"query": "q", "summarize": True},
+            )
+            assert response.status_code == 200
+            assert response.json()["summary"] == "**summary**"
+            forwarded = search_service.debug_search.call_args.args[0]
+            assert forwarded.summarize is True
+        finally:
+            history_store.close()
+
+
+def test_summarize_endpoint_updates_history_snapshot() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = MagicMock()
+        config.storage.data_dir = tmpdir
+        search_service = MagicMock()
+        search_service.summarize_for_web.return_value = SummarizeResponse(
+            summary="**summary**",
+            char_count=11,
+            token_count=3,
+            model="deepseek-v4-flash",
+            duration_ms=145,
+            source_char_count=20,
+            source_token_count=6,
+            compression_ratio=0.5,
+        )
+        history_store = SearchHistoryStore(tmpdir + "/history.db")
+        history_store.add(
+            SearchHistory(
+                history_id="h-summary",
+                query="q",
+                source=SearchSource.DEBUG,
+                params={"query": "q"},
+                result_summary={"total_results": 1},
+                snapshot={
+                    "query": "q",
+                    "results": [],
+                    "params": {"query": "q", "summarize": False},
+                },
+                created_at="2026-08-12T10:00:00Z",
+            )
+        )
+
+        app = create_app(
+            search_service=search_service,
+            store=MagicMock(),
+            state_store=MagicMock(),
+            config=config,
+            history_store=history_store,
+        )
+        try:
+            client = TestClient(app)
+            response = client.post(
+                "/api/search/summarize",
+                json={
+                    "query": "q",
+                    "passages": [{"text": "passage", "source": "Page A"}],
+                    "history_id": "h-summary",
+                },
+            )
+            assert response.status_code == 200
+            assert response.json()["summary"] == "**summary**"
+            updated = history_store.get("h-summary")
+            assert updated is not None
+            assert updated.snapshot["summary"] == "**summary**"
+            assert updated.snapshot["summary_model"] == "deepseek-v4-flash"
+            assert updated.snapshot["summary_token_count"] == 3
+            assert updated.snapshot["summary_duration_ms"] == 145
+            assert updated.snapshot["summary_compression_ratio"] == 0.5
+            assert updated.snapshot["params"]["summarize"] is True
         finally:
             history_store.close()

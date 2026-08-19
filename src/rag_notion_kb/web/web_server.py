@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from rag_notion_kb.app_context import AppContext
 from rag_notion_kb.config import Settings
+from rag_notion_kb.exceptions import SummarizationError
 from rag_notion_kb.models import (
     ChunkDetail,
     DebugSearchRequest,
@@ -22,8 +23,9 @@ from rag_notion_kb.models import (
     PageSummary,
     SearchHistory,
     SearchSource,
+    SummarizeRequest,
+    SummarizeResponse,
     SyncResult,
-    SyncTask,
     TreePageNode,
 )
 from rag_notion_kb.processing.images import clean_image_alt
@@ -504,6 +506,37 @@ def create_app(
         if search_service is None:
             raise HTTPException(status_code=500, detail="SearchService not initialized")
         return await run_in_threadpool(search_service.debug_search, req)
+
+    @app.post("/api/search/summarize")
+    async def summarize_search(req: SummarizeRequest) -> SummarizeResponse:
+        """Generate a summary from already-retrieved passages."""
+        if search_service is None:
+            raise HTTPException(status_code=500, detail="SearchService not initialized")
+        try:
+            result = await run_in_threadpool(
+                search_service.summarize_for_web,
+                req.query,
+                req.passages,
+            )
+        except SummarizationError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if req.history_id and history_store is not None:
+            record = history_store.get(req.history_id)
+            if record is not None and record.snapshot is not None:
+                snapshot = dict(record.snapshot)
+                snapshot["summary"] = result.summary
+                snapshot["summary_error"] = None
+                snapshot["summary_model"] = result.model
+                snapshot["summary_char_count"] = result.char_count
+                snapshot["summary_token_count"] = result.token_count
+                snapshot["summary_duration_ms"] = result.duration_ms
+                snapshot["summary_source_char_count"] = result.source_char_count
+                snapshot["summary_source_token_count"] = result.source_token_count
+                snapshot["summary_compression_ratio"] = result.compression_ratio
+                if isinstance(snapshot.get("params"), dict):
+                    snapshot["params"]["summarize"] = True
+                history_store.update_snapshot(req.history_id, snapshot)
+        return result
 
     @app.get("/api/search/history")
     async def list_search_history(

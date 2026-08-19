@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from rag_notion_kb.config import Settings
-from rag_notion_kb.exceptions import RetrievalError, StorageError
+from rag_notion_kb.exceptions import RetrievalError, StorageError, SummarizationError
 from rag_notion_kb.models import (
     ChunkMetadata,
     ChunkType,
@@ -14,6 +14,7 @@ from rag_notion_kb.models import (
     DebugSearchRequest,
     SearchHit,
     SearchSource,
+    SummaryPassage,
 )
 from rag_notion_kb.services.search_service import SearchService
 from rag_notion_kb.storage.search_history_store import SearchHistoryStore
@@ -49,6 +50,7 @@ def _service(
     sparse_hits: list[SearchHit],
     reranked: list[tuple[int, float]] | None = None,
     rerank_error: bool = False,
+    summarizer: MagicMock | None = None,
 ) -> tuple[SearchService, SearchHistoryStore, MagicMock]:
     history_store = SearchHistoryStore(tmp_path / "history.db")
     embedding = MagicMock()
@@ -71,6 +73,7 @@ def _service(
         state_store=state_store,
         config=Settings(),
         history_store=history_store,
+        summarizer=summarizer,
     )
     return service, history_store, reranker
 
@@ -122,6 +125,162 @@ def test_debug_search_exposes_stage_scores(tmp_path: Path) -> None:
     assert history[0].result_summary["max_score"] == pytest.approx(0.95)
     assert history[0].snapshot is not None
     assert len(history[0].snapshot["results"]) == 2
+
+
+def test_debug_search_summarize_false_does_not_call_summarizer(tmp_path: Path) -> None:
+    summarizer = MagicMock()
+    service, _, _ = _service(
+        tmp_path,
+        dense_hits=[_hit(1, "content", 0.8)],
+        sparse_hits=[],
+        reranked=[(0, 0.9)],
+        summarizer=summarizer,
+    )
+
+    response = service.debug_search(
+        DebugSearchRequest(
+            query="test",
+            dense_weight=1.0,
+            sparse_weight=0.0,
+            context_mode=ContextExpandMode.NONE,
+            summarize=False,
+        )
+    )
+
+    assert response.summary is None
+    assert response.summary_error is None
+    summarizer.summarize.assert_not_called()
+
+
+def test_debug_search_summarize_true_sets_summary(tmp_path: Path) -> None:
+    summarizer = MagicMock()
+    summarizer.summarize.return_value = "integrated summary"
+    service, history_store, _ = _service(
+        tmp_path,
+        dense_hits=[_hit(1, "content", 0.8)],
+        sparse_hits=[],
+        reranked=[(0, 0.9)],
+        summarizer=summarizer,
+    )
+
+    response = service.debug_search(
+        DebugSearchRequest(
+            query="test",
+            dense_weight=1.0,
+            sparse_weight=0.0,
+            context_mode=ContextExpandMode.NONE,
+            summarize=True,
+        )
+    )
+
+    assert response.summary == "integrated summary"
+    assert response.summary_error is None
+    assert response.error is None
+    summarizer.summarize.assert_called_once()
+    query, passages = summarizer.summarize.call_args.args
+    assert query == "test"
+    assert passages[0][0] == "content"
+    assert passages[0][1] == "Title 1 / # Root > ## Section"
+
+    history = history_store.list_recent(source=SearchSource.DEBUG)
+    assert history[0].snapshot["summary"] == "integrated summary"
+
+
+def test_debug_search_image_hit_passes_text_context_to_summarizer(tmp_path: Path) -> None:
+    summarizer = MagicMock()
+    summarizer.summarize.return_value = "image summary"
+    image_hit = _hit(1, "[Image: diagram]\ncontext", 0.8)
+    image_hit.metadata.chunk_type = ChunkType.IMAGE
+    service, _, _ = _service(
+        tmp_path,
+        dense_hits=[image_hit],
+        sparse_hits=[],
+        reranked=[(0, 0.9)],
+        summarizer=summarizer,
+    )
+
+    service.debug_search(
+        DebugSearchRequest(
+            query="test",
+            dense_weight=1.0,
+            sparse_weight=0.0,
+            context_mode=ContextExpandMode.NONE,
+            summarize=True,
+        )
+    )
+
+    passages = summarizer.summarize.call_args.args[1]
+    assert passages[0][0] == "[Image: diagram]\ncontext"
+
+
+def test_debug_search_summarizer_error_is_non_fatal(tmp_path: Path) -> None:
+    summarizer = MagicMock()
+    summarizer.summarize.side_effect = SummarizationError("boom")
+    service, _, _ = _service(
+        tmp_path,
+        dense_hits=[_hit(1, "content", 0.8)],
+        sparse_hits=[],
+        reranked=[(0, 0.9)],
+        summarizer=summarizer,
+    )
+
+    response = service.debug_search(
+        DebugSearchRequest(
+            query="test",
+            dense_weight=1.0,
+            sparse_weight=0.0,
+            context_mode=ContextExpandMode.NONE,
+            summarize=True,
+        )
+    )
+
+    assert response.error is None
+    assert response.summary is None
+    assert response.summary_error == "boom"
+
+
+def test_summarize_for_web_returns_display_metadata(tmp_path: Path) -> None:
+    summarizer = MagicMock()
+    summarizer.summarize.return_value = "web summary"
+    summarizer.config.model = "deepseek-v4-flash"
+    service, _, _ = _service(
+        tmp_path,
+        dense_hits=[],
+        sparse_hits=[],
+        summarizer=summarizer,
+    )
+
+    result = service.summarize_for_web(
+        "query",
+        [SummaryPassage(text="passage", source="Page A")],
+    )
+
+    assert result.summary == "web summary"
+    assert result.char_count == len("web summary")
+    assert result.token_count >= 1
+    assert result.model == summarizer.config.model
+    assert result.source_char_count == len("passage")
+    assert result.source_token_count >= 1
+    assert 0 <= result.compression_ratio <= 1
+    assert result.duration_ms >= 0
+
+
+def test_debug_search_records_requested_source(tmp_path: Path) -> None:
+    service, history_store, _ = _service(
+        tmp_path,
+        dense_hits=[_hit(1, "content", 0.8)],
+        sparse_hits=[],
+        reranked=[(0, 0.9)],
+    )
+
+    service.debug_search(
+        DebugSearchRequest(query="test", context_mode=ContextExpandMode.NONE),
+        source=SearchSource.MCP,
+    )
+
+    history = history_store.list_recent(source=SearchSource.MCP)
+    assert len(history) == 1
+    assert history_store.list_recent(source=SearchSource.DEBUG) == []
 
 
 def test_debug_search_rerank_failure_falls_back_to_fusion(tmp_path: Path) -> None:

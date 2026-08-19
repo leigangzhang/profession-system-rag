@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 from types import TracebackType
@@ -13,6 +12,7 @@ from rag_notion_kb.notion.client import NotionClient
 from rag_notion_kb.processing.chunking import MarkdownProcessor
 from rag_notion_kb.processing.images import ImageExtractor
 from rag_notion_kb.services.search_service import SearchService
+from rag_notion_kb.services.summarization import SummarizationService
 from rag_notion_kb.services.sync_progress import SyncProgressTracker
 from rag_notion_kb.services.sync_service import SyncService
 from rag_notion_kb.services.vectorize_worker import VectorizeWorker
@@ -51,6 +51,11 @@ class AppContext:
         # Embedding / reranker
         self.embedding = EmbeddingService(self.settings.embedding)
         self.reranker = RerankerService(self.settings.reranker)
+        self.summarizer: SummarizationService | None = None
+        summarization_config = getattr(self.settings, "summarization", None)
+        api_key = getattr(summarization_config, "api_key", "")
+        if isinstance(api_key, str) and api_key.strip():
+            self.summarizer = SummarizationService(summarization_config)
 
         # Storage
         db_path = self._data_dir / "sync_state.db"
@@ -77,6 +82,7 @@ class AppContext:
             state_store=self.state_store,
             config=self.settings,
             history_store=self.history_store,
+            summarizer=self.summarizer,
         )
         self.progress_tracker = SyncProgressTracker(ttl_seconds=300, db_path=db_path)
         self.worker = VectorizeWorker(
@@ -92,6 +98,7 @@ class AppContext:
         return [
             self.reranker,
             self.embedding,
+            self.summarizer,
             self.store,
             self.state_store,
             self.root_store,

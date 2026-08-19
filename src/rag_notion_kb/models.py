@@ -237,6 +237,7 @@ class DebugSearchRequest(BaseModel):
     filters: dict[str, list[str]] = Field(default_factory=dict)
     context_mode: ContextExpandMode = ContextExpandMode.H2
     max_tokens: int = Field(4000, ge=100, le=8000)
+    summarize: bool = False
 
 
 class StageScores(BaseModel):
@@ -280,6 +281,37 @@ class DebugSearchResponse(BaseModel):
     results: list[DebugSearchHit]
     latency_ms: int
     error: str | None = None
+    summary: str | None = None
+    summary_error: str | None = None
+    history_id: str | None = None
+
+
+class SummaryPassage(BaseModel):
+    """A passage sent to the web summarization endpoint."""
+
+    text: str
+    source: str = ""
+
+
+class SummarizeRequest(BaseModel):
+    """Request payload for asynchronous web summary generation."""
+
+    query: str
+    passages: list[SummaryPassage]
+    history_id: str | None = None
+
+
+class SummarizeResponse(BaseModel):
+    """Summary result with display metadata for the web UI."""
+
+    summary: str
+    char_count: int
+    token_count: int
+    model: str
+    duration_ms: int
+    source_char_count: int
+    source_token_count: int
+    compression_ratio: float
 
 
 class SearchSource(str, Enum):

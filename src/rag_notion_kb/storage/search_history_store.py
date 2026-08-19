@@ -175,7 +175,7 @@ class SearchHistoryStore:
         self._flush_pending()
         try:
             rows = self._execute(
-                "SELECT source, result_summary FROM search_history"
+                "SELECT source, result_summary, snapshot FROM search_history"
             ).fetchall()
         except sqlite3.Error as exc:
             raise StorageError(f"Failed to read search history stats: {exc}") from exc
@@ -190,6 +190,8 @@ class SearchHistoryStore:
         zero_result_count = 0
         top_scores: list[float] = []
         latencies: list[float] = []
+        llm_durations: list[float] = []
+        llm_ratios: list[float] = []
 
         for row in rows:
             source = SearchSource(row["source"])
@@ -212,6 +214,19 @@ class SearchHistoryStore:
             if latency is not None:
                 latencies.append(max(0.0, float(latency)))
 
+            if row["snapshot"]:
+                try:
+                    snapshot = json.loads(row["snapshot"])
+                except (TypeError, ValueError):
+                    snapshot = None
+                if isinstance(snapshot, dict):
+                    duration = snapshot.get("summary_duration_ms")
+                    ratio = snapshot.get("summary_compression_ratio")
+                    if isinstance(duration, (int, float)):
+                        llm_durations.append(max(0.0, float(duration)))
+                    if isinstance(ratio, (int, float)):
+                        llm_ratios.append(max(0.0, min(1.0, float(ratio))))
+
         p99 = self._percentile(top_scores, 99)
         p90 = self._percentile(top_scores, 90)
         p60 = self._percentile(top_scores, 60)
@@ -233,6 +248,16 @@ class SearchHistoryStore:
             "top_score_p60": round(p60, 4),
             "average_latency_ms": round(sum(latencies) / len(latencies), 1)
             if latencies
+            else 0.0,
+            "llm_summary_avg_duration_ms": round(
+                sum(llm_durations) / len(llm_durations), 1
+            )
+            if llm_durations
+            else 0.0,
+            "llm_summary_avg_compression_ratio": round(
+                sum(llm_ratios) / len(llm_ratios), 4
+            )
+            if llm_ratios
             else 0.0,
             "quality_score": round(quality_score, 4),
         }
@@ -258,6 +283,19 @@ class SearchHistoryStore:
         if row is None:
             return None
         return self._row_to_history(row)
+
+    def update_snapshot(self, history_id: str, snapshot: dict[str, object]) -> bool:
+        """Update the saved result snapshot for one history record."""
+        self._flush_pending()
+        try:
+            result = self._execute(
+                "UPDATE search_history SET snapshot = ? WHERE history_id = ?",
+                (self._dump_json(snapshot), history_id),
+                commit=True,
+            )
+        except sqlite3.Error as exc:
+            raise StorageError(f"Failed to update search history {history_id}: {exc}") from exc
+        return result.rowcount > 0
 
     def delete(self, history_id: str) -> bool:
         """Delete one history record and report whether it existed."""

@@ -226,6 +226,7 @@ class TestServeCommand:
             result = runner.invoke(app, ["serve"])
 
             assert result.exit_code == 0
+            assert result.stdout == ""
             mock_mcp.run.assert_called_once()
 
     def test_serve_config_error(self, runner: CliRunner) -> None:

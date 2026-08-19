@@ -6,18 +6,21 @@ Uses mock SyncService and SearchService to control test data.
 
 from __future__ import annotations
 
-import pytest
 from unittest.mock import MagicMock
+
+import pytest
 
 from rag_notion_kb.config import Settings
 from rag_notion_kb.mcp_server import MCPServer
 from rag_notion_kb.models import (
     ChunkMetadata,
     ChunkType,
-    SearchResult,
+    DebugSearchHit,
+    DebugSearchRequest,
+    DebugSearchResponse,
+    StageScores,
     SyncResult,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -72,18 +75,51 @@ def _make_metadata(
     )
 
 
-def _make_search_result(
+def _make_debug_hit(
     text: str = "Some content",
     score: float = 0.95,
     page_id: str = "page-1",
     page_title: str = "Test Page",
     matched_snippet: str | None = "exact match snippet",
-) -> SearchResult:
-    return SearchResult(
-        text=text,
-        score=score,
-        source=_make_metadata(page_id=page_id, page_title=page_title),
+    chunk_type: str = "text",
+    rank: int = 1,
+) -> DebugSearchHit:
+    return DebugSearchHit(
+        rank=rank,
+        page_id=page_id,
+        page_title=page_title,
+        page_url=f"https://notion.so/{page_id}",
+        chunk_index=0,
+        chunk_type=chunk_type,
+        header_path="# Section 1",
+        header_level=1,
+        chunk_text=text,
+        expanded_text=text,
+        scores=StageScores(final_score=score),
         matched_snippet=matched_snippet,
+        image_url=None,
+    )
+
+
+def _make_debug_response(
+    results: list[DebugSearchHit] | None = None,
+    *,
+    summary: str | None = None,
+    summary_error: str | None = None,
+) -> DebugSearchResponse:
+    hits = results if results is not None else []
+    return DebugSearchResponse(
+        query="test query",
+        params=DebugSearchRequest(query="test query"),
+        total_dense=len(hits),
+        total_sparse=0,
+        total_after_filter=len(hits),
+        total_after_fusion=len(hits),
+        total_after_rerank=0,
+        results=hits,
+        latency_ms=12,
+        summary=summary,
+        summary_error=summary_error,
     )
 
 
@@ -101,15 +137,16 @@ async def _call_tool(mcp_server: MCPServer, name: str, arguments: dict) -> str:
 @pytest.mark.asyncio
 async def test_rag_search_returns_results(mcp_server: MCPServer, mock_search_service: MagicMock) -> None:
     """Verify markdown output contains page titles, scores, and header paths."""
-    mock_search_service.search.return_value = [
-        _make_search_result(text="First result content", score=0.95, page_title="Alpha"),
-        _make_search_result(
+    mock_search_service.search_with_summary.return_value = _make_debug_response([
+        _make_debug_hit(text="First result content", score=0.95, page_title="Alpha", rank=1),
+        _make_debug_hit(
             text="Second result content",
             score=0.80,
             page_title="Beta",
             matched_snippet=None,
+            rank=2,
         ),
-    ]
+    ])
 
     result = await _call_tool(mcp_server, "rag_search", {"query": "test query"})
 
@@ -127,7 +164,7 @@ async def test_rag_search_returns_results(mcp_server: MCPServer, mock_search_ser
 @pytest.mark.asyncio
 async def test_rag_search_empty_results(mcp_server: MCPServer, mock_search_service: MagicMock) -> None:
     """Returns the 'no results' message when search yields nothing."""
-    mock_search_service.search.return_value = []
+    mock_search_service.search_with_summary.return_value = _make_debug_response([])
 
     result = await _call_tool(mcp_server, "rag_search", {"query": "nothing"})
 
@@ -139,7 +176,7 @@ async def test_rag_search_passes_page_ids_filter(
     mcp_server: MCPServer, mock_search_service: MagicMock
 ) -> None:
     """filters.page_ids is forwarded into the filters dict."""
-    mock_search_service.search.return_value = [_make_search_result()]
+    mock_search_service.search_with_summary.return_value = _make_debug_response([])
 
     await _call_tool(
         mcp_server,
@@ -147,7 +184,7 @@ async def test_rag_search_passes_page_ids_filter(
         {"query": "q", "filters": {"page_ids": ["page-a", "page-b"]}},
     )
 
-    call_kwargs = mock_search_service.search.call_args.kwargs
+    call_kwargs = mock_search_service.search_with_summary.call_args.kwargs
     assert call_kwargs["filters"] == {"page_ids": ["page-a", "page-b"]}
 
 
@@ -156,7 +193,7 @@ async def test_rag_search_passes_header_level_filter(
     mcp_server: MCPServer, mock_search_service: MagicMock
 ) -> None:
     """filters.header_level is forwarded into the filters dict."""
-    mock_search_service.search.return_value = [_make_search_result()]
+    mock_search_service.search_with_summary.return_value = _make_debug_response([])
 
     await _call_tool(
         mcp_server,
@@ -164,7 +201,7 @@ async def test_rag_search_passes_header_level_filter(
         {"query": "q", "filters": {"header_level": 3}},
     )
 
-    call_kwargs = mock_search_service.search.call_args.kwargs
+    call_kwargs = mock_search_service.search_with_summary.call_args.kwargs
     assert call_kwargs["filters"] == {"header_level": 3}
 
 
@@ -173,11 +210,11 @@ async def test_rag_search_missing_optional_params_uses_defaults(
     mcp_server: MCPServer, mock_search_service: MagicMock
 ) -> None:
     """When optional params are omitted, Claude-friendly defaults flow."""
-    mock_search_service.search.return_value = [_make_search_result()]
+    mock_search_service.search_with_summary.return_value = _make_debug_response([])
 
     await _call_tool(mcp_server, "rag_search", {"query": "just query"})
 
-    call_kwargs = mock_search_service.search.call_args.kwargs
+    call_kwargs = mock_search_service.search_with_summary.call_args.kwargs
     assert call_kwargs["filters"] is None
     assert call_kwargs["top_k"] == 10
     assert call_kwargs["max_tokens"] == 4000
@@ -187,13 +224,14 @@ async def test_rag_search_missing_optional_params_uses_defaults(
     assert call_kwargs["rerank"] is True
     assert call_kwargs["rerank_model"] == "qwen3-vl-rerank"
     assert call_kwargs["context_mode"] == "h2"
+    assert call_kwargs["summarize"] is True
 
 
 @pytest.mark.asyncio
 async def test_rag_search_forwards_web_tuning_parameters(
     mcp_server: MCPServer, mock_search_service: MagicMock
 ) -> None:
-    mock_search_service.search.return_value = [_make_search_result()]
+    mock_search_service.search_with_summary.return_value = _make_debug_response([])
 
     await _call_tool(
         mcp_server,
@@ -207,7 +245,7 @@ async def test_rag_search_forwards_web_tuning_parameters(
         },
     )
 
-    call_kwargs = mock_search_service.search.call_args.kwargs
+    call_kwargs = mock_search_service.search_with_summary.call_args.kwargs
     assert call_kwargs["dense_weight"] == 0.0
     assert call_kwargs["sparse_weight"] == 1.0
     assert call_kwargs["min_similarity"] == 0.4
@@ -220,7 +258,7 @@ async def test_rag_search_merges_page_id_shortcut_with_filters(
     mcp_server: MCPServer, mock_search_service: MagicMock
 ) -> None:
     """page_id is merged with filters.page_ids without duplicate IDs."""
-    mock_search_service.search.return_value = [_make_search_result()]
+    mock_search_service.search_with_summary.return_value = _make_debug_response([])
 
     await _call_tool(
         mcp_server,
@@ -232,7 +270,7 @@ async def test_rag_search_merges_page_id_shortcut_with_filters(
         },
     )
 
-    call_kwargs = mock_search_service.search.call_args.kwargs
+    call_kwargs = mock_search_service.search_with_summary.call_args.kwargs
     assert call_kwargs["filters"] == {"page_ids": ["page-a", "page-b"]}
 
 
@@ -241,7 +279,7 @@ async def test_rag_search_passes_typed_metadata_filters(
     mcp_server: MCPServer, mock_search_service: MagicMock
 ) -> None:
     """All typed metadata fields are forwarded unchanged."""
-    mock_search_service.search.return_value = [_make_search_result()]
+    mock_search_service.search_with_summary.return_value = _make_debug_response([])
 
     await _call_tool(
         mcp_server,
@@ -256,7 +294,7 @@ async def test_rag_search_passes_typed_metadata_filters(
         },
     )
 
-    call_kwargs = mock_search_service.search.call_args.kwargs
+    call_kwargs = mock_search_service.search_with_summary.call_args.kwargs
     assert call_kwargs["filters"] == {
         "page_title": ["Alpha"],
         "chunk_type": ["text", "table"],
@@ -269,7 +307,7 @@ async def test_rag_search_page_size_maps_to_top_k(
     mcp_server: MCPServer, mock_search_service: MagicMock
 ) -> None:
     """page_size is used as the backend top_k."""
-    mock_search_service.search.return_value = [_make_search_result()]
+    mock_search_service.search_with_summary.return_value = _make_debug_response([])
 
     await _call_tool(
         mcp_server,
@@ -277,7 +315,7 @@ async def test_rag_search_page_size_maps_to_top_k(
         {"query": "q", "page_size": 7},
     )
 
-    assert mock_search_service.search.call_args.kwargs["top_k"] == 7
+    assert mock_search_service.search_with_summary.call_args.kwargs["top_k"] == 7
 
 
 @pytest.mark.asyncio
@@ -285,9 +323,9 @@ async def test_rag_search_highlight_length_is_applied(
     mcp_server: MCPServer, mock_search_service: MagicMock
 ) -> None:
     """max_highlight_length controls snippet inclusion and truncation."""
-    mock_search_service.search.return_value = [
-        _make_search_result(matched_snippet="0123456789")
-    ]
+    mock_search_service.search_with_summary.return_value = _make_debug_response([
+        _make_debug_hit(matched_snippet="0123456789")
+    ])
 
     truncated = await _call_tool(
         mcp_server,
@@ -306,6 +344,47 @@ async def test_rag_search_highlight_length_is_applied(
 
 
 @pytest.mark.asyncio
+async def test_rag_search_summarize_true_returns_summary(
+    mcp_server: MCPServer, mock_search_service: MagicMock
+) -> None:
+    """When summarize is true, the synthesized summary block is returned."""
+    mock_search_service.search_with_summary.return_value = _make_debug_response(
+        [_make_debug_hit()],
+        summary="**Deduplicated summary**",
+    )
+
+    result = await _call_tool(
+        mcp_server,
+        "rag_search",
+        {"query": "q", "summarize": True},
+    )
+
+    assert result == "**Deduplicated summary**"
+    call_kwargs = mock_search_service.search_with_summary.call_args.kwargs
+    assert call_kwargs["summarize"] is True
+
+
+@pytest.mark.asyncio
+async def test_rag_search_summarize_error_falls_back_to_results(
+    mcp_server: MCPServer, mock_search_service: MagicMock
+) -> None:
+    """A summary failure is non-fatal and original results are still returned."""
+    mock_search_service.search_with_summary.return_value = _make_debug_response(
+        [_make_debug_hit(page_title="Fallback Page")],
+        summary_error="summarizer unavailable",
+    )
+
+    result = await _call_tool(
+        mcp_server,
+        "rag_search",
+        {"query": "q", "summarize": True},
+    )
+
+    assert "摘要失败：summarizer unavailable" in result
+    assert "Fallback Page" in result
+
+
+@pytest.mark.asyncio
 async def test_rag_search_exposes_claude_friendly_schema(
     mcp_server: MCPServer,
 ) -> None:
@@ -320,9 +399,11 @@ async def test_rag_search_exposes_claude_friendly_schema(
     assert "page_size" in properties
     assert "max_highlight_length" in properties
     assert "search_mode" in properties
+    assert "summarize" in properties
     assert properties["page_size"]["default"] == 10
     assert properties["page_size"]["maximum"] == 25
     assert properties["search_mode"]["enum"] == ["hybrid", "dense", "sparse"]
+    assert properties["summarize"]["default"] is True
     assert set(filters) == {
         "page_ids",
         "header_level",

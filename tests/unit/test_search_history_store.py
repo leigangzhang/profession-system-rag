@@ -136,6 +136,8 @@ def test_stats_empty_history(store: SearchHistoryStore) -> None:
         "top_score_p90": 0.0,
         "top_score_p60": 0.0,
         "average_latency_ms": 0.0,
+        "llm_summary_avg_duration_ms": 0.0,
+        "llm_summary_avg_compression_ratio": 0.0,
         "quality_score": 0.0,
     }
 
@@ -207,3 +209,24 @@ def test_stats_treats_legacy_successless_record_as_success(store: SearchHistoryS
     assert stats["success_rate"] == 1.0
     assert stats["zero_result_rate"] == 0.0
     assert stats["top_score_p90"] == pytest.approx(0.8)
+
+
+def test_stats_aggregates_llm_summary_metrics(store: SearchHistoryStore) -> None:
+    records = [
+        _record("1", "first", SearchSource.DEBUG, "2026-08-12T10:00:00Z"),
+        _record("2", "second", SearchSource.MCP, "2026-08-12T10:01:00Z"),
+    ]
+    records[0].snapshot = {
+        "summary_duration_ms": 120,
+        "summary_compression_ratio": 0.2,
+    }
+    records[1].snapshot = {
+        "summary_duration_ms": 180,
+        "summary_compression_ratio": 0.4,
+    }
+    for record in records:
+        store.add(record)
+
+    stats = store.stats()
+    assert stats["llm_summary_avg_duration_ms"] == pytest.approx(150.0)
+    assert stats["llm_summary_avg_compression_ratio"] == pytest.approx(0.3)
