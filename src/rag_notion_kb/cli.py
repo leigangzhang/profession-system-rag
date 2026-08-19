@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -353,11 +354,15 @@ def web(
 def serve() -> None:
     """Start the MCP server on stdio."""
     settings = _build_settings()
+    setup_logging(
+        level=settings.logging.level,
+        fmt=settings.logging.format,
+        stream=sys.stderr,
+    )
 
     try:
         with AppContext(settings=settings) as ctx:
             mcp_server = MCPServer.from_context(ctx)
-            console.print("[green]Starting MCP server on stdio...[/green]")
             mcp_server.run()
     except ConfigError as exc:
         console.print(f"[red]Configuration error: {exc}[/red]")

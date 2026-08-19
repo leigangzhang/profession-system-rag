@@ -27,16 +27,19 @@
         </div>
         <div class="history-stat source-stat">
           <span>来源分布</span>
-          <div class="source-lines">
-            <a-tag color="arcoblue" size="small">
-              debug {{ sourceCounts.debug }}
-            </a-tag>
-            <a-tag color="purple" size="small">
-              mcp {{ sourceCounts.mcp }}
-            </a-tag>
-            <a-tag color="gray" size="small">
-              cli {{ sourceCounts.cli }}
-            </a-tag>
+          <div class="source-visual">
+            <div class="source-pie" :style="sourcePieStyle"></div>
+            <div class="source-lines">
+              <span class="source-legend-item">
+                <i class="source-dot debug"></i>debug {{ sourceCounts.debug }}
+              </span>
+              <span class="source-legend-item">
+                <i class="source-dot mcp"></i>mcp {{ sourceCounts.mcp }}
+              </span>
+              <span class="source-legend-item">
+                <i class="source-dot cli"></i>cli {{ sourceCounts.cli }}
+              </span>
+            </div>
           </div>
         </div>
         <div class="history-stat">
@@ -47,24 +50,24 @@
           <small>有结果请求占比</small>
         </div>
         <div class="history-stat">
-          <span>零结果率</span>
-          <strong :class="metricClass(stats.zero_result_rate, false)">
-            {{ fmtPct(stats.zero_result_rate) }}
-          </strong>
-          <small>无结果请求占比</small>
+          <span>Top分-P90</span>
+          <strong>{{ formatScore(stats.top_score_p90) }}</strong>
+          <small>结果最高分P90</small>
         </div>
         <div class="history-stat">
-          <span>Top 分水位线</span>
-          <div class="score-lines">
-            <span><em>P99</em> {{ formatScore(stats.top_score_p99) }}</span>
-            <span><em>P90</em> {{ formatScore(stats.top_score_p90) }}</span>
-            <span><em>P60</em> {{ formatScore(stats.top_score_p60) }}</span>
-          </div>
-        </div>
-        <div class="history-stat">
-          <span>平均耗时</span>
+          <span>RAG检索平均时长</span>
           <strong>{{ fmtLatency(stats.average_latency_ms) }}</strong>
           <small>每次检索</small>
+        </div>
+        <div class="history-stat">
+          <span>LLM摘要平均时长</span>
+          <strong>{{ llmSummaryDurationLabel }}</strong>
+          <small>已生成摘要记录</small>
+        </div>
+        <div class="history-stat">
+          <span>摘要平均压缩率</span>
+          <strong>{{ llmSummaryCompressionLabel }}</strong>
+          <small>摘要Token / 输入Token</small>
         </div>
         <div class="history-stat">
           <span>整体评估</span>
@@ -217,6 +220,29 @@ export default {
       };
     });
 
+    const sourcePieStyle = computed(() => {
+      const total = sourceCounts.value.debug + sourceCounts.value.mcp + sourceCounts.value.cli;
+      if (!total) return { background: '#f2f3f5' };
+      const debugEnd = (sourceCounts.value.debug / total) * 100;
+      const mcpEnd = debugEnd + (sourceCounts.value.mcp / total) * 100;
+      return {
+        background: [
+          `conic-gradient(#165dff 0% ${debugEnd}%,`,
+          `#722ed1 ${debugEnd}% ${mcpEnd}%,`,
+          `#86909c ${mcpEnd}% 100%)`,
+        ].join(' '),
+      };
+    });
+
+    const llmSummaryDurationLabel = computed(() => {
+      return utils.fmtLatency(stats.value && stats.value.llm_summary_avg_duration_ms);
+    });
+
+    const llmSummaryCompressionLabel = computed(() => {
+      const value = stats.value && stats.value.llm_summary_avg_compression_ratio;
+      return utils.fmtPct(value);
+    });
+
     const visibleHistory = computed(() => {
       const query = keyword.value.trim().toLowerCase();
       if (!query) return history.value;
@@ -341,6 +367,9 @@ export default {
       keyword,
       clearing,
       sourceCounts,
+      sourcePieStyle,
+      llmSummaryDurationLabel,
+      llmSummaryCompressionLabel,
       visibleHistory,
       sourceColor,
       resultSummary,
@@ -367,7 +396,7 @@ export default {
 
 .history-stats {
   display: grid;
-  grid-template-columns: repeat(7, minmax(120px, 1fr));
+  grid-template-columns: repeat(8, minmax(120px, 1fr));
   gap: 10px;
 }
 
@@ -403,11 +432,55 @@ export default {
   font-size: 10px;
 }
 
+.source-visual {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.source-pie {
+  flex: 0 0 46px;
+  width: 46px;
+  height: 46px;
+  border: 1px solid var(--border-light);
+  border-radius: 50%;
+}
+
 .source-lines {
   display: flex;
+  min-width: 0;
+  flex-direction: column;
   flex-wrap: wrap;
-  gap: 4px;
-  margin-top: 8px;
+  gap: 3px;
+}
+
+.source-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-secondary);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.source-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+.source-dot.debug {
+  background: #165dff;
+}
+
+.source-dot.mcp {
+  background: #722ed1;
+}
+
+.source-dot.cli {
+  background: #86909c;
 }
 
 .score-lines {

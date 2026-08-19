@@ -106,6 +106,8 @@
 
     debugSearch: (params) =>
       request('/api/search/debug', { method: 'POST', body: params }),
+    summarizeSearch: (params) =>
+      request('/api/search/summarize', { method: 'POST', body: params }),
     listHistory: (limit = 500, source = null) =>
       request(`/api/search/history${query({ limit, source })}`),
     getHistoryStats: () => request('/api/search/history/stats'),

@@ -85,12 +85,10 @@
                 <a-select
                   v-model="form.rerankModel"
                   allow-clear
-                  placeholder="不使用 ReRank"
-                  @change="rerankModelChanged"
+                  placeholder="Qwen3-VL-Rerank"
                 >
                   <a-option value="">不使用 ReRank</a-option>
-                  <a-option value="qwen3-vl-rerank">qwen3-vl-rerank</a-option>
-                  <a-option value="qwen3-vl-reranker">qwen3-vl-reranker</a-option>
+                  <a-option value="qwen3-vl-rerank">Qwen3-VL-Rerank</a-option>
                   <a-option
                     v-for="model in customRerankModels"
                     :key="model"
@@ -100,10 +98,10 @@
                   </a-option>
                 </a-select>
               </label>
+            </section>
 
-              <a-checkbox v-model="form.skipRerank" @change="skipRerankChanged">
-                跳过 ReRank
-              </a-checkbox>
+            <section class="form-section">
+              <a-checkbox v-model="form.summarize">LLM生成摘要（对检索到的多文本块进行LLM去重压缩和摘要总结）</a-checkbox>
             </section>
 
             <section class="form-section">
@@ -170,7 +168,11 @@
         </aside>
 
         <section class="debug-results">
-          <div v-if="response" class="result-stats">
+          <div
+            v-if="response"
+            class="result-stats"
+            :class="{ 'stats-full': !form.summarize }"
+          >
             <div class="result-stat">
               <span>Dense</span>
               <strong>{{ response.total_dense }}</strong>
@@ -192,8 +194,72 @@
               <strong>{{ response.total_after_rerank }}</strong>
             </div>
             <div class="result-stat">
-              <span>耗时</span>
+              <span>RAG检索时长</span>
               <strong>{{ latencyLabel }}</strong>
+            </div>
+            <div v-if="form.summarize" class="result-stat">
+              <span>LLM摘要时长</span>
+              <strong>{{ summaryDurationLabel }}</strong>
+            </div>
+            <div v-if="form.summarize" class="result-stat">
+              <span>摘要压缩率</span>
+              <strong>{{ summaryCompressionLabel }}</strong>
+            </div>
+          </div>
+
+          <div
+            v-if="form.summarize"
+            class="summary-panel"
+            :class="{ 'summary-collapsed': summary.status === 'ready' && !summaryExpanded }"
+          >
+            <header class="summary-panel-head">
+              <span class="summary-panel-label">{{ summaryTitle }}</span>
+              <div class="summary-panel-meta">
+                <span v-if="summary.status === 'generating'" class="summary-generating">
+                  <IconLoading />
+                  Loading...
+                </span>
+                <template v-else-if="summary.status === 'ready'">
+                  <span class="chunk-size">
+                    {{ summary.charCount }} chars / ~{{ summary.tokenCount }} tk
+                  </span>
+                  <span class="summary-meta-item">{{ summary.model }}</span>
+                </template>
+                <span v-else-if="summary.status === 'error'" class="summary-error">
+                  摘要失败
+                </span>
+              </div>
+            </header>
+
+            <div
+              v-if="summary.status === 'generating'"
+              class="summary-panel-placeholder"
+            >
+              <IconLoading />
+              LLM摘要正在生成中…
+            </div>
+            <div
+              v-else-if="summary.status === 'ready'"
+              class="summary-panel-body markdown-content"
+              v-html="renderSummaryContent(summary.text)"
+            ></div>
+            <div v-if="summary.status === 'ready'" class="summary-panel-footer">
+              <button
+                type="button"
+                class="result-toggle"
+                @click="toggleSummary"
+              >
+                {{ summaryExpanded ? '收起' : '展开' }}
+              </button>
+            </div>
+            <div
+              v-else-if="summary.status === 'error'"
+              class="summary-panel-placeholder summary-error-text"
+            >
+              {{ summary.error }}
+            </div>
+            <div v-else class="summary-panel-placeholder">
+              开启「生成摘要」后，此处将展示 LLM 摘要。
             </div>
           </div>
 
@@ -225,9 +291,12 @@
                     L{{ hit.header_level }}
                   </div>
                 </div>
-                <div class="result-final">
-                  <strong>{{ formatScore(hit.scores.final_score) }}</strong>
-                  <span>Final</span>
+                <div class="result-card-meta-right">
+                  <span class="chunk-size">{{ chunkSizeLabel(hit) }}</span>
+                  <div class="result-final">
+                    <strong>{{ formatScore(hit.scores.final_score) }}</strong>
+                    <span>Final</span>
+                  </div>
                 </div>
               </header>
 
@@ -314,9 +383,9 @@ export default {
       topK: 5,
       maxTokens: 4000,
       minSimilarity: 0.4,
-      rerankModel: '',
-      skipRerank: false,
+      rerankModel: 'qwen3-vl-rerank',
       contextMode: 'h2',
+      summarize: false,
     });
     const denseWeight = ref(0.5);
     const filters = ref([]);
@@ -328,6 +397,19 @@ export default {
     const resultMessage = ref('');
     const resultError = ref(false);
     const expandedResults = reactive({});
+    const summary = reactive({
+      status: 'idle',
+      text: '',
+      error: '',
+      charCount: 0,
+      tokenCount: 0,
+      model: '',
+      durationMs: 0,
+      compressionRatio: 0,
+      sourceCharCount: 0,
+      sourceTokenCount: 0,
+    });
+    const summaryExpanded = ref(false);
 
     const sparseWeight = computed(() =>
       Math.max(0, Math.min(1, 1 - Number(denseWeight.value)))
@@ -343,6 +425,25 @@ export default {
     const latencyLabel = computed(() => {
       if (!response.value) return '';
       return utils.fmtLatency(response.value.latency_ms);
+    });
+
+    const summaryDurationLabel = computed(() => {
+      if (!summary.durationMs) return '—';
+      if (summary.durationMs >= 1000) {
+        return `${(summary.durationMs / 1000).toFixed(1)}s`;
+      }
+      return `${summary.durationMs}ms`;
+    });
+
+    const summaryTitle = computed(() => {
+      if (!summary.text) return 'LLM摘要';
+      const heading = summary.text.match(/^#\s+(.+?)\s*$/m);
+      return heading ? heading[1].trim() : 'LLM摘要';
+    });
+
+    const summaryCompressionLabel = computed(() => {
+      if (summary.status !== 'ready') return '—';
+      return `${(summary.compressionRatio * 100).toFixed(1)}%`;
     });
 
     function optionsForFilter(field) {
@@ -394,19 +495,12 @@ export default {
         sparse_weight: sparseWeight.value,
         top_k: utils.clampNumber(form.topK, 1, 100, 5),
         min_similarity: utils.clampNumber(form.minSimilarity, 0, 1, 0.4),
-        rerank_model: form.skipRerank ? '' : form.rerankModel,
+        rerank_model: form.rerankModel,
         filters: collectFilters(),
         context_mode: form.contextMode,
         max_tokens: utils.clampNumber(form.maxTokens, 100, 8000, 4000),
+        summarize: form.summarize,
       };
-    }
-
-    function rerankModelChanged() {
-      if (form.rerankModel) form.skipRerank = false;
-    }
-
-    function skipRerankChanged(value) {
-      if (value) form.rerankModel = '';
     }
 
     function handleQueryKeydown(event) {
@@ -420,16 +514,90 @@ export default {
       return utils.formatScore(value);
     }
 
+    function chunkSizeLabel(hit) {
+      const text = utils.sanitizeImageContext(
+        hit.expanded_text || hit.chunk_text || ''
+      );
+      return `${text.length} chars / ~${utils.estimateTokens(text)} tk`;
+    }
+
     function renderResultContent(hit) {
       return utils.renderChunkMarkdown(
         hit.expanded_text || hit.chunk_text || ''
       );
     }
 
+    function renderSummaryContent(summary) {
+      const lines = (summary || '').split('\n');
+      const headingIndex = lines.findIndex((line) =>
+        /^#\s+/.test(line.trim())
+      );
+      if (headingIndex >= 0) lines.splice(headingIndex, 1);
+      const cleaned = lines
+        .join('\n')
+        .replace(/^\s*\n+/, '')
+        .replace(/\n+\s*$/, '');
+      return utils.renderChunkMarkdown(cleaned);
+    }
+
+    function resetSummary() {
+      summary.status = 'idle';
+      summary.text = '';
+      summary.error = '';
+      summary.charCount = 0;
+      summary.tokenCount = 0;
+      summary.model = '';
+      summary.durationMs = 0;
+      summary.compressionRatio = 0;
+      summary.sourceCharCount = 0;
+      summary.sourceTokenCount = 0;
+      summaryExpanded.value = false;
+    }
+
+    function buildSummaryPassages(results) {
+      return (results || []).map((hit) => ({
+        text: hit.expanded_text || hit.chunk_text || '',
+        source: [hit.page_title, hit.header_path].filter(Boolean).join(' / '),
+      }));
+    }
+
+    function setSummaryReady(summaryText, meta) {
+      summary.text = String(summaryText || '')
+        .replace(/^\s*\n+/, '')
+        .replace(/\n+\s*$/, '');
+      summary.charCount = Number(meta.char_count) || summary.text.length;
+      summary.tokenCount =
+        Number(meta.token_count) || Math.max(1, Math.ceil(summary.text.length / 4));
+      summary.model = meta.model || '';
+      summary.durationMs = Number(meta.duration_ms) || 0;
+      summary.compressionRatio = Number(meta.compression_ratio) || 0;
+      summary.sourceCharCount = Number(meta.source_char_count) || 0;
+      summary.sourceTokenCount = Number(meta.source_token_count) || 0;
+      summary.status = 'ready';
+    }
+
+    function toggleSummary() {
+      summaryExpanded.value = !summaryExpanded.value;
+    }
+
+    function bindSummaryContent() {
+      const content = document.querySelector('.summary-panel-body');
+      if (!content) return;
+      content.querySelectorAll('img').forEach((image) => {
+        image.addEventListener('error', utils.handleImageError);
+        if (image.complete && image.naturalWidth === 0) {
+          image.dispatchEvent(new Event('error'));
+        }
+      });
+      utils.highlightCodeBlocks(content);
+    }
+
     function bindResultContent() {
-      const container = document.querySelector('.debug-results .results-list');
+      const container = document.querySelector('.debug-results');
       if (!container) return;
-      container.querySelectorAll('.result-content').forEach((content) => {
+      container
+        .querySelectorAll('.result-content, .summary-panel-body')
+        .forEach((content) => {
         content.querySelectorAll('img').forEach((image) => {
           image.addEventListener('error', utils.handleImageError);
           if (image.complete && image.naturalWidth === 0) {
@@ -437,6 +605,16 @@ export default {
           }
         });
         utils.highlightCodeBlocks(content);
+      });
+    }
+
+    async function requestSummary(payload) {
+      if (typeof api.summarizeSearch === 'function') {
+        return api.summarizeSearch(payload);
+      }
+      return api.request('/api/search/summarize', {
+        method: 'POST',
+        body: payload,
       });
     }
 
@@ -453,12 +631,15 @@ export default {
       response.value = null;
       resultMessage.value = '检索中…';
       resultError.value = false;
+      resetSummary();
       Object.keys(expandedResults).forEach((key) => {
         delete expandedResults[key];
       });
 
+      let nextResponse;
       try {
-        const nextResponse = await api.debugSearch(params);
+        const searchParams = { ...params, summarize: false };
+        nextResponse = await api.debugSearch(searchParams);
         response.value = nextResponse;
         resultMessage.value = nextResponse.error || '';
         resultError.value = Boolean(nextResponse.error);
@@ -474,8 +655,28 @@ export default {
         resultMessage.value = utils.errorMessage(error, '检索失败');
         resultError.value = true;
         toast(resultMessage.value, 'error');
-      } finally {
         searching.value = false;
+        return;
+      }
+
+      searching.value = false;
+
+      if (params.summarize && nextResponse.results.length) {
+        summary.status = 'generating';
+        summary.error = '';
+        try {
+          const summaryResult = await requestSummary({
+            query: params.query,
+            passages: buildSummaryPassages(nextResponse.results),
+            history_id: nextResponse.history_id || null,
+          });
+          setSummaryReady(summaryResult.summary, summaryResult);
+          await nextTick();
+          bindSummaryContent();
+        } catch (error) {
+          summary.status = 'error';
+          summary.error = utils.errorMessage(error, '摘要生成失败');
+        }
       }
     }
 
@@ -517,9 +718,8 @@ export default {
       if (minimum === undefined) minimum = source === 'debug' ? 0.4 : 0;
       form.minSimilarity = utils.clampNumber(minimum, 0, 1, 0.4);
 
-      const rerankModel = params.rerank_model || '';
+      const rerankModel = params.rerank_model ?? 'qwen3-vl-rerank';
       form.rerankModel = rerankModel;
-      form.skipRerank = !rerankModel;
       if (
         rerankModel &&
         !['qwen3-vl-rerank', 'qwen3-vl-reranker'].includes(rerankModel) &&
@@ -536,6 +736,7 @@ export default {
         else mode = 'h2';
       }
       form.contextMode = mode || 'h2';
+      form.summarize = Boolean(params.summarize);
 
       filters.value = [];
       Object.entries(params.filters || {}).forEach(([field, rawValues]) => {
@@ -549,12 +750,32 @@ export default {
       resultMessage.value = '加载历史参数…';
       resultError.value = false;
       response.value = null;
+      resetSummary();
       try {
         const history = await api.getHistory(historyId);
-        fillParams(history.params || { query: history.query }, history.source);
+        const snapshotParams =
+          history.snapshot && history.snapshot.params
+            ? history.snapshot.params
+            : history.params;
+        fillParams(snapshotParams || { query: history.query }, history.source);
         if (history.snapshot) {
           response.value = history.snapshot;
           resultMessage.value = '';
+          const snapshot = history.snapshot;
+          if (snapshot.summary) {
+            setSummaryReady(snapshot.summary, {
+              char_count: snapshot.summary_char_count,
+              token_count: snapshot.summary_token_count,
+              model: snapshot.summary_model,
+              duration_ms: snapshot.summary_duration_ms,
+              compression_ratio: snapshot.summary_compression_ratio,
+              source_char_count: snapshot.summary_source_char_count,
+              source_token_count: snapshot.summary_source_token_count,
+            });
+          } else if (snapshot.summary_error) {
+            summary.status = 'error';
+            summary.error = snapshot.summary_error;
+          }
           await nextTick();
           bindResultContent();
         } else {
@@ -590,17 +811,23 @@ export default {
       resultMessage,
       resultError,
       expandedResults,
+      summary,
+      summaryExpanded,
       latencyLabel,
+      summaryDurationLabel,
+      summaryCompressionLabel,
+      summaryTitle,
       optionsForFilter,
       isFieldUsed,
       addFilter,
       removeFilter,
       filterFieldChanged,
-      rerankModelChanged,
-      skipRerankChanged,
       handleQueryKeydown,
       formatScore,
+      chunkSizeLabel,
       renderResultContent,
+      renderSummaryContent,
+      toggleSummary,
       executeSearch,
       toggleResult,
       openChunk,
@@ -750,9 +977,13 @@ export default {
 
 .result-stats {
   display: grid;
-  grid-template-columns: repeat(6, minmax(90px, 1fr));
+  grid-template-columns: repeat(8, minmax(90px, 1fr));
   gap: 8px;
   margin-bottom: 14px;
+}
+
+.result-stats.stats-full {
+  grid-template-columns: repeat(6, minmax(90px, 1fr));
 }
 
 .result-stat {
@@ -796,6 +1027,121 @@ export default {
 .result-message.error {
   color: #f53f3f;
   border-color: #fca5a5;
+}
+
+.result-message.warning {
+  min-height: 44px;
+  color: #9f5c00;
+  background: #fff7e6;
+  border: 1px solid #ffd591;
+}
+
+.summary-panel {
+  margin-bottom: 14px;
+  background: #fff;
+  border: 1px solid var(--border-light);
+  border-radius: 8px;
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+}
+
+.summary-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.summary-panel-label {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-link);
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.summary-panel-meta {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.summary-meta-item {
+  padding: 2px 6px;
+  white-space: nowrap;
+  background: var(--bg-hover);
+  border-radius: 4px;
+  font-size: 11px;
+}
+
+.summary-generating {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #3370ff;
+  white-space: nowrap;
+}
+
+.summary-error {
+  color: #f53f3f;
+  white-space: nowrap;
+}
+
+.summary-panel-placeholder {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 72px;
+  padding: 14px;
+  color: var(--text-tertiary);
+  font-size: 13px;
+}
+
+.summary-error-text {
+  color: #f53f3f;
+}
+
+.summary-panel-body {
+  position: relative;
+  max-height: 220px;
+  overflow: hidden;
+  padding: 14px;
+  overflow-wrap: anywhere;
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.summary-panel.summary-collapsed .summary-panel-body::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 44px;
+  background: linear-gradient(transparent, #fff);
+  content: "";
+  pointer-events: none;
+}
+
+.summary-panel:not(.summary-collapsed) .summary-panel-body {
+  max-height: none;
+}
+
+.summary-panel-footer {
+  padding: 0 14px 14px;
+}
+
+.summary-panel-footer .result-toggle {
+  margin-top: 0;
 }
 
 .results-list {
@@ -853,6 +1199,21 @@ h3 {
 .result-final {
   flex: 0 0 auto;
   text-align: right;
+}
+
+.result-card-meta-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+}
+
+.chunk-size {
+  flex: 0 0 auto;
+  color: var(--text-tertiary);
+  font-family: "SF Mono", "Menlo", monospace;
+  font-size: 9px;
+  white-space: nowrap;
 }
 
 .result-final strong {
@@ -946,13 +1307,25 @@ h3 {
   }
 
   .result-stats,
+  .result-stats.stats-full,
   .score-bars {
     grid-template-columns: repeat(3, 1fr);
   }
 }
 
 @media (max-width: 720px) {
+  .summary-panel-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .summary-panel-meta {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+
   .result-stats,
+  .result-stats.stats-full,
   .score-bars {
     grid-template-columns: repeat(2, 1fr);
   }

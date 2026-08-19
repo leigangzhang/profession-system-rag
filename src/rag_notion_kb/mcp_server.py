@@ -62,7 +62,7 @@ class MCPServer:
     """MCP stdio server exposing RAG tools to MCP-compatible hosts."""
 
     @classmethod
-    def from_context(cls, ctx: AppContext) -> "MCPServer":
+    def from_context(cls, ctx: AppContext) -> MCPServer:
         """Create an MCP server from a fully wired AppContext."""
         return cls(
             sync_service=ctx.sync_service,
@@ -127,6 +127,27 @@ class MCPServer:
         lines.extend(["", result.text, "", "---", ""])
         return lines
 
+    @staticmethod
+    def _render_debug_hit(
+        hit: Any,
+        index: int,
+        max_highlight_length: int,
+    ) -> list[str]:
+        lines = [
+            f"### 结果 {index}",
+            "",
+            f"- **页面**：[{hit.page_title}]({hit.page_url})",
+            f"- **页面 ID**：`{hit.page_id}`",
+            f"- **位置**：{hit.header_path or '未分类'}",
+            f"- **分块类型**：{hit.chunk_type}",
+            f"- **相关度**：{hit.scores.final_score:.4f}",
+        ]
+        if max_highlight_length > 0 and hit.matched_snippet:
+            highlight = hit.matched_snippet[:max_highlight_length]
+            lines.extend(["", f"> 原文匹配：{highlight}"])
+        lines.extend(["", hit.expanded_text or hit.chunk_text, "", "---", ""])
+        return lines
+
     def _register_tools(self) -> None:
         server = self._server
 
@@ -150,7 +171,7 @@ class MCPServer:
             page_size: Annotated[
                 int,
                 Field(
-                    default=10,
+                    default=6,
                     ge=1,
                     le=25,
                     description=(
@@ -158,7 +179,7 @@ class MCPServer:
                         "keep the response smaller."
                     ),
                 ),
-            ] = 10,
+            ] = 6,
             max_highlight_length: Annotated[
                 int,
                 Field(
@@ -211,12 +232,12 @@ class MCPServer:
             max_tokens: Annotated[
                 int,
                 Field(
-                    default=4000,
+                    default=2560,
                     ge=100,
                     le=8000,
                     description="Maximum tokens for each returned passage.",
                 ),
-            ] = 4000,
+            ] = 2560,
             rerank: Annotated[
                 bool,
                 Field(
@@ -247,6 +268,15 @@ class MCPServer:
                     ),
                 ),
             ] = "qwen3-vl-rerank",
+            summarize: Annotated[
+                bool,
+                Field(
+                    description=(
+                        "When true, deduplicate and summarize the retrieved "
+                        "passages into a single Markdown text block."
+                    ),
+                ),
+            ] = True,
         ) -> list[TextContent]:
             """Search the local Notion knowledge base and return ranked passages with citations.
 
@@ -261,7 +291,7 @@ class MCPServer:
             """
             dense_weight, sparse_weight = _SEARCH_MODE_WEIGHTS[search_mode]
             merged_filters = self._merge_filters(filters, page_id)
-            results = self.search_service.search(
+            response = self.search_service.search_with_summary(
                 query=query,
                 top_k=page_size,
                 max_tokens=max_tokens,
@@ -273,9 +303,10 @@ class MCPServer:
                 min_similarity=min_similarity,
                 rerank_model=rerank_model,
                 context_mode=context_mode,
+                summarize=summarize,
             )
 
-            if not results:
+            if not response.results:
                 return [
                     TextContent(
                         type="text",
@@ -286,10 +317,17 @@ class MCPServer:
                     )
                 ]
 
-            lines = [f"## 检索结果：{query}", f"共 {len(results)} 条结果。", ""]
-            for index, result in enumerate(results, start=1):
+            if summarize and response.summary:
+                return [TextContent(type="text", text=response.summary)]
+
+            lines: list[str] = []
+            if summarize and response.summary_error:
+                lines.extend([f"_摘要失败：{response.summary_error}_", ""])
+
+            lines.extend([f"## 检索结果：{query}", f"共 {len(response.results)} 条结果。", ""])
+            for index, hit in enumerate(response.results, start=1):
                 lines.extend(
-                    self._render_result(result, index, max_highlight_length)
+                    self._render_debug_hit(hit, index, max_highlight_length)
                 )
             return [TextContent(type="text", text="\n".join(lines))]
 

@@ -32,6 +32,21 @@ class RerankerConfig(BaseModel):
     max_retries: int = 3
 
 
+class SummarizationConfig(BaseModel):
+    api_key: str = ""
+    base_url: str = "https://api.deepseek.com/v1"
+    model: str = "deepseek-v4-flash"
+    max_retries: int = 3
+    timeout_seconds: int = 60
+    prompt: str = (
+        "You are a knowledge-base summarization assistant. "
+        "Deduplicate the supplied retrieved passages, then write a single "
+        "structured Markdown summary with the key facts and a clear conclusion. "
+        "Keep source citations. Do not invent information. If evidence is "
+        "missing or conflicting, say so explicitly."
+    )
+
+
 class StorageConfig(BaseModel):
     data_dir: str = "~/.rag_kb"
 
@@ -76,6 +91,7 @@ class Settings(BaseSettings):
     notion: NotionConfig = Field(default_factory=NotionConfig)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     reranker: RerankerConfig = Field(default_factory=RerankerConfig)
+    summarization: SummarizationConfig = Field(default_factory=SummarizationConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     chunking: ChunkingConfig = Field(default_factory=ChunkingConfig)
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
