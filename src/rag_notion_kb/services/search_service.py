@@ -536,7 +536,11 @@ class SearchService:
         return {
             "total_chunks": store_stats.get("total_chunks", 0),
             "total_pages": len(pages),
-            "synced_pages": sum(1 for p in pages if p.status == "synced"),
+            "synced_pages": sum(
+                1
+                for p in pages
+                if p.status == "synced" or p.vector_status == "indexed"
+            ),
             "failed_pages": sum(1 for p in pages if p.status == "failed"),
             "last_synced_time": self.state_store.get_last_sync_time(),
         }
