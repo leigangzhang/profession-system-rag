@@ -11,7 +11,6 @@ from rag_notion_kb.models import (
     Chunk,
     ChunkMetadata,
     ChunkType,
-    PageMetadata,
     PageSyncState,
 )
 from rag_notion_kb.services.search_service import SearchService
@@ -159,6 +158,21 @@ def test_stats_returns_counts(deps: dict) -> None:
     assert stats["synced_pages"] == 2
     assert stats["failed_pages"] == 0
     assert stats["last_synced_time"] == "2026-08-10T10:00:00Z"
+
+
+def test_stats_counts_vectorized_pages_as_synced(deps: dict) -> None:
+    _seed_kb(deps)
+    state_store = deps["state_store"]
+    for page_id in ("p1", "p2"):
+        state = state_store.get(page_id)
+        assert state is not None
+        state.status = "fetched"
+        state.vector_status = "indexed"
+        state_store.upsert(state)
+
+    stats = _make_service(deps).stats()
+
+    assert stats["synced_pages"] == 2
 
 
 def test_get_page_detail_reconstructs_text(deps: dict) -> None:
