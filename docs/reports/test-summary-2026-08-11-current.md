@@ -16,7 +16,7 @@ PYTHONPATH=src python3 -m pytest tests/unit -v --tb=short
 ## 集成测试
 
 ```bash
-export DASHSCOPE_API_KEY="sk-ws-H.EMYRDRI.9D9E.MEUCIAhSUSXUjp2yujgy-BMyIjA9LQdCyJimDW4T-9t9K1edAiEAoxTh8qIPI3YOUZd43Mc7Krhy3oxDzMBRh3R93E6FvhQ"
+export DASHSCOPE_API_KEY="sk-ws-*****FvhQ"
 export TMPDIR=/Users/ray/Workspace/warehouse-profession-system/.tmp
 PYTHONPATH=src python3 -m pytest tests/integration -v --tb=short
 ```
